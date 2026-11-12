@@ -327,7 +327,7 @@ def model_generate_compiled(model, tokenizer, model_kwargs, generate_kwargs):
     logits_processor_list = build_logits_processors(
         tokenizer, cfg_scale, timeshift_bias, types_first, temperature,
         timing_temperature, mania_column_temperature, taiko_hit_temperature,
-        lookback_time, device,
+        lookback_time, device, context_type=context_type,
     )
     # Hoist MonotonicTimeShift out of the per-step list into an O(1) incremental
     # masker. Only safe without CFG (CFG merges the 2-stream logits before the

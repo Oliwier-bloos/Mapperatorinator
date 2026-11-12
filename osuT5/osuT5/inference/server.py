@@ -6,13 +6,13 @@ import traceback
 import torch
 from multiprocessing.connection import Listener, Client
 
-from transformers import LogitsProcessorList, ClassifierFreeGuidanceLogitsProcessor, TemperatureLogitsWarper
+from transformers import LogitsProcessorList, ClassifierFreeGuidanceLogitsProcessor
 from transformers.modeling_outputs import BaseModelOutput
 
 from ..event import EventType, ContextType
 from .logit_processors import ConditionalTemperatureLogitsWarper, get_beat_type_tokens, \
-    get_mania_type_tokens, get_scroll_speed_tokens, TimeshiftBias, LookbackBiasLogitsWarper, \
-    MonotonicTimeShiftLogitsProcessor
+    get_mania_type_tokens, get_scroll_speed_tokens, get_snapping_tokens, get_mania_column_tokens, \
+    TimeshiftBias, LookbackBiasLogitsWarper, MonotonicTimeShiftLogitsProcessor
 from .cache_utils import get_cache
 from ..model import Mapperatorinator
 from ..tokenizer import Tokenizer
@@ -86,8 +86,13 @@ def get_eos_token_id(tokenizer, lookback_time: float = 0, lookahead_time: float 
 
 def build_logits_processors(tokenizer, cfg_scale, timeshift_bias, types_first,
                             temperature, timing_temperature, mania_column_temperature,
-                            taiko_hit_temperature, lookback_time, device):
-    """Create the logits processors used by every generate path."""
+                            taiko_hit_temperature, lookback_time, device,
+                            context_type: ContextType | None = None):
+    """Create the logits processors used by every generate path.
+
+    `context_type` is the out context being generated in this call, if known. Models that put
+    the event type after the time (types_first=False) need it to apply the timing temperature.
+    """
     logits_processor_list = LogitsProcessorList()
     if cfg_scale > 1.0:
         logits_processor_list.append(ClassifierFreeGuidanceLogitsProcessor(cfg_scale))
@@ -102,19 +107,19 @@ def build_logits_processors(tokenizer, cfg_scale, timeshift_bias, types_first,
                 tokenizer.event_end[EventType.TIME_SHIFT]
             )
         )
-    if types_first:
-        logits_processor_list.append(ConditionalTemperatureLogitsWarper(
-            temperature,
-            timing_temperature,
-            mania_column_temperature,
-            taiko_hit_temperature,
-            types_first,
-            get_beat_type_tokens(tokenizer),
-            get_mania_type_tokens(tokenizer),
-            get_scroll_speed_tokens(tokenizer),
-        ))
-    else:
-        logits_processor_list.append(TemperatureLogitsWarper(temperature))
+    logits_processor_list.append(ConditionalTemperatureLogitsWarper(
+        temperature,
+        timing_temperature,
+        mania_column_temperature,
+        taiko_hit_temperature,
+        types_first,
+        get_beat_type_tokens(tokenizer),
+        get_mania_type_tokens(tokenizer),
+        get_scroll_speed_tokens(tokenizer),
+        snapping_tokens=get_snapping_tokens(tokenizer),
+        mania_column_tokens=get_mania_column_tokens(tokenizer),
+        timing_context=context_type == ContextType.TIMING,
+    ))
     if lookback_time > 0:
         logits_processor_list.append(LookbackBiasLogitsWarper(lookback_time, tokenizer, types_first, device))
     return logits_processor_list
@@ -265,7 +270,7 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
     logits_processor_list = build_logits_processors(
         tokenizer, cfg_scale, timeshift_bias, types_first, temperature,
         timing_temperature, mania_column_temperature, taiko_hit_temperature,
-        lookback_time, model.device,
+        lookback_time, model.device, context_type=context_type,
     )
 
     # Prepare cache

@@ -33,6 +33,16 @@ def get_scroll_speed_tokens(tokenizer: Tokenizer) -> tuple[int, ...]:
                  if EventType.SCROLL_SPEED in tokenizer.event_start else [])
 
 
+def get_snapping_tokens(tokenizer: Tokenizer) -> tuple[int, ...]:
+    return tuple(range(tokenizer.event_start[EventType.SNAPPING], tokenizer.event_end[EventType.SNAPPING])
+                 if EventType.SNAPPING in tokenizer.event_start else [])
+
+
+def get_mania_column_tokens(tokenizer: Tokenizer) -> tuple[int, ...]:
+    return tuple(range(tokenizer.event_start[EventType.MANIA_COLUMN], tokenizer.event_end[EventType.MANIA_COLUMN])
+                 if EventType.MANIA_COLUMN in tokenizer.event_start else [])
+
+
 class TimeshiftBias(LogitsProcessor):
     def __init__(self, timeshift_bias: float, time_start: int, time_end: int):
         self.timeshift_bias = timeshift_bias
@@ -45,6 +55,26 @@ class TimeshiftBias(LogitsProcessor):
 
 
 class ConditionalTemperatureLogitsWarper(LogitsProcessor):
+    """Temperature warper with separate temperatures for timing, mania columns and taiko hits.
+
+    Which tokens get which temperature depends on the token order the model was trained with.
+
+    types_first=True (e.g. V28, V29, V31): every event group starts with its type token, so
+    the time shift right after a beat, measure or timing point type is timing, and the token
+    three after a mania note type is its column.
+
+    types_first=False (e.g. V30, V32): every event group ends with its type token, so those
+    look-back rules cannot work. Instead:
+      - the TIMING context pass uses the timing temperature for every token, because that
+        pass only contains timing events;
+      - mania column tokens are resampled at the mania column temperature within their own
+        category, which keeps the total probability of picking a column unchanged.
+
+    In both orders a taiko hit (whose don/kat type is stored in the hitsound token) follows
+    a snapping token and a scroll speed token, and no other object has that pattern, so the
+    taiko hit temperature uses the same rule for both.
+    """
+
     def __init__(
             self,
             temperature: float,
@@ -55,31 +85,82 @@ class ConditionalTemperatureLogitsWarper(LogitsProcessor):
             beat_type_tokens: tuple[int, ...],
             mania_type_tokens: tuple[int, ...],
             scroll_speed_tokens: tuple[int, ...],
+            snapping_tokens: tuple[int, ...] = (),
+            mania_column_tokens: tuple[int, ...] = (),
+            timing_context: bool = False,
     ):
+        for name, value in [
+            ("temperature", temperature),
+            ("timing_temperature", timing_temperature),
+            ("mania_column_temperature", mania_column_temperature),
+            ("taiko_hit_temperature", taiko_hit_temperature),
+        ]:
+            if not value > 0:
+                raise ValueError(f"`{name}` has to be a strictly positive float, but is {value}")
+
+        # Each rule is (temperature, [(offset, tokens), ...]). A rule matches a sequence when,
+        # for every entry, the token `offset` positions from the end is one of `tokens`.
+        # Rules are checked in order and the first match wins.
+        self.conditionals: list[tuple[float, list[tuple[int, torch.Tensor]]]] = []
+        # Each entry is (temperature, start, end): a token range sampled at its own temperature.
+        self.category_temperatures: list[tuple[float, int, int]] = []
+
+        if not types_first and timing_context:
+            # The timing pass only contains timing events, so every token is timing
+            self.temperature = timing_temperature
+            return
         self.temperature = temperature
-        self.conditionals = []
 
-        if timing_temperature != temperature and len(beat_type_tokens) > 0:
-            self.conditionals.append((timing_temperature, beat_type_tokens, 1))
-        if mania_column_temperature != temperature and len(mania_type_tokens) > 0:
-            self.conditionals.append((mania_column_temperature, mania_type_tokens, 3))
-        if taiko_hit_temperature != temperature and len(scroll_speed_tokens) > 0:
-            self.conditionals.append((taiko_hit_temperature, scroll_speed_tokens, 1))
+        def tensor(tokens):
+            return torch.tensor(tokens, dtype=torch.long)
 
-        if not types_first:
-            print("WARNING: Conditional temperature is not supported for types_first=False. Ignoring.")
-            self.conditionals = []
+        if types_first:
+            if timing_temperature != temperature and len(beat_type_tokens) > 0:
+                self.conditionals.append((timing_temperature, [(1, tensor(beat_type_tokens))]))
+            if mania_column_temperature != temperature and len(mania_type_tokens) > 0:
+                self.conditionals.append((mania_column_temperature, [(3, tensor(mania_type_tokens))]))
+        elif mania_column_temperature != temperature and len(mania_column_tokens) > 0:
+            start, end = mania_column_tokens[0], mania_column_tokens[-1] + 1
+            if end - start != len(mania_column_tokens):
+                raise ValueError("Mania column tokens must be a contiguous token range")
+            self.category_temperatures.append((mania_column_temperature, start, end))
 
-        self.max_offset = max([offset for _, _, offset in self.conditionals], default=0)
+        if taiko_hit_temperature != temperature and len(scroll_speed_tokens) > 0 and len(snapping_tokens) > 0:
+            self.conditionals.append((taiko_hit_temperature, [(2, tensor(snapping_tokens)), (1, tensor(scroll_speed_tokens))]))
+
+    def _row_temperatures(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.Tensor:
+        temperatures = torch.full((scores.shape[0], 1), self.temperature, dtype=scores.dtype, device=scores.device)
+        # Apply the rules in reverse so that the first matching rule wins
+        for i in reversed(range(len(self.conditionals))):
+            temperature, pattern = self.conditionals[i]
+            if input_ids.shape[1] < max(offset for offset, _ in pattern):
+                continue
+            matches = torch.ones(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
+            for j, (offset, tokens) in enumerate(pattern):
+                if tokens.device != input_ids.device:
+                    tokens = tokens.to(input_ids.device)
+                    pattern[j] = (offset, tokens)
+                matches &= torch.isin(input_ids[:, -offset], tokens)
+            temperatures = torch.where(matches.to(scores.device).unsqueeze(1), temperature, temperatures)
+        return temperatures
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.Tensor:
-        if len(self.conditionals) > 0:
-            lookback = input_ids[0, -self.max_offset:].cpu()
-            for temperature, tokens, offset in self.conditionals:
-                if len(lookback) >= offset and lookback[-offset] in tokens:
-                    return scores / temperature
+        if len(self.conditionals) == 0 and len(self.category_temperatures) == 0:
+            return scores / self.temperature
 
-        return scores / self.temperature
+        temperatures = self._row_temperatures(input_ids, scores) if len(self.conditionals) > 0 else self.temperature
+        scores_processed = scores / temperatures
+
+        for temperature, start, end in self.category_temperatures:
+            category = scores[:, start:end]
+            warped = category / temperature
+            # Keep the category's total probability mass, only reshape the distribution inside it
+            mass = torch.logsumexp(scores_processed[:, start:end], dim=-1, keepdim=True)
+            warped_mass = torch.logsumexp(warped, dim=-1, keepdim=True)
+            shift = torch.where(torch.isfinite(mass) & torch.isfinite(warped_mass), mass - warped_mass, 0)
+            scores_processed[:, start:end] = warped + shift
+
+        return scores_processed
 
 
 class LookbackBiasLogitsWarper(LogitsProcessor):
