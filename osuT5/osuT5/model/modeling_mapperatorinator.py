@@ -239,15 +239,15 @@ class Mapperatorinator(PreTrainedModel, GenerationMixin):
         negative_prompt_attention_mask=None,
         **kwargs,
     ):
-        # Add negative prompt to the input for classifier free guidance
+        # CFG expects conditional inputs first and negative inputs second.
         if negative_prompt is not None:
             decoder_input_ids = decoder_input_ids.repeat((2, 1))
-            decoder_input_ids[:decoder_input_ids.shape[0] // 2, :negative_prompt.shape[1]] = negative_prompt
+            decoder_input_ids[decoder_input_ids.shape[0] // 2:, :negative_prompt.shape[1]] = negative_prompt
 
             if decoder_attention_mask is not None:
                 decoder_attention_mask = decoder_attention_mask.repeat((2, 1))
                 if negative_prompt_attention_mask is not None:
-                    decoder_attention_mask[:decoder_attention_mask.shape[0] // 2, :negative_prompt_attention_mask.shape[1]] = negative_prompt_attention_mask
+                    decoder_attention_mask[decoder_attention_mask.shape[0] // 2:, :negative_prompt_attention_mask.shape[1]] = negative_prompt_attention_mask
 
             if encoder_outputs is not None:
                 encoder_outputs = BaseModelOutput(last_hidden_state=encoder_outputs.last_hidden_state.repeat((2, 1, 1)))
