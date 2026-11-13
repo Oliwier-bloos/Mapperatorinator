@@ -404,6 +404,26 @@ python timing_benchmark.py --name v32-temp09 --num-songs 20 timing_temperature=0
 
 Results are written to `benchmarks/timing_runs/<name>/results.json`. Runs that already have a generated beatmap are reused, so use a new `--name` when you change settings. Each song takes about 20 seconds on an RTX 4080 Laptop GPU, most of it loading the model.
 
+## Mania benchmark
+
+`mania_benchmark.py` compares generated osu!mania maps with human maps of the same songs, using held-out songs that have ranked maps with the chosen key count (4K by default). For each song it picks the human map closest to `--target-sr`, generates a map for a 60-second window with that map's star rating, year and hold note ratio, and compares the two over the window:
+
+- star rating error,
+- rhythm: how many chord timestamps match within 25 ms (onset F1), next to the same score between two human difficulties of the song,
+- note count, hold note share, share of 3+ note chords and jacks,
+- whether the BPM matches everywhere in the window,
+- notes that overlap in the same column (should always be 0).
+
+```sh
+python mania_benchmark.py --name v32
+# Give the model the human map's timing, like timing a song yourself before generating
+python mania_benchmark.py --name v32-human-timing --human-timing
+# Anything after the options is passed to inference.py as a Hydra override
+python mania_benchmark.py --name v32-cfg cfg_scale=1.5 "cfg_conditions=[hold_note_ratio,difficulty]"
+```
+
+Results are written to `benchmarks/mania4k_runs/<name>/results.json`. Each song takes about a minute on an RTX 4080 Laptop GPU.
+
 ## See also
 - [Mapper Classifier](./classifier/README.md)
 - [RComplexion](./rcomplexion/README.md)
