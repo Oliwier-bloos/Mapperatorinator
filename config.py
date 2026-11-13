@@ -77,6 +77,7 @@ class InferenceConfig:
     max_batch_size: int = 16  # Maximum batch size for inference (only used for parallel sampling or super timing)
     resnap_events: bool = True  # Resnap notes to the timing after generation
     snap_near_perfect_overlaps: bool = True  # Snap nearly overlapping positions to each other
+    mania_max_full_chord_run: int = 0  # Mania: max full chords (e.g. [1234] in 4K) in a row before one note is dropped; 0 = off
     fast_decoder_loop: bool = False  # Replace HF generate with a CUDA-graph decode loop; ~2-6x faster decode (fp16/bf16 > fp32), quality-equivalent. Requires CUDA; falls back to the stock loop where unsupported.
     super_timing_fast_loop: bool = False  # Use the fast decoder loop for super timing instead of the batched-parallel path. Separate from fast_decoder_loop because super timing's parallel path may be faster on some GPUs; benchmark before enabling.
 

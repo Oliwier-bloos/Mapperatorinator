@@ -66,6 +66,7 @@ fast_decoder_loop: false # Replace HF generate with a CUDA-graph decode loop; ~2
 super_timing_fast_loop: false # Use the fast decoder loop for super timing instead of the batched-parallel path; benchmark on your GPU before enabling
 resnap_events: true      # Resnap events to the timing after generation
 snap_near_perfect_overlaps: true  # Snap nearly overlapping positions to each other
+mania_max_full_chord_run: 0  # Mania: max full chords (e.g. [1234] in 4K) in a row before one note is dropped; 0 = off
 
 # Metadata settings
 bpm: null                 # Beats per minute of input audio

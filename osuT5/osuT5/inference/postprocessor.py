@@ -159,6 +159,65 @@ def fix_mania_column_overlaps(hit_object_strings: list[str], key_count: int, bea
     return result, fixes
 
 
+def full_chord_drop_order(key_count: int) -> list[int]:
+    """Columns to drop from successive full chords: outer columns first, alternating sides."""
+    order = []
+    left, right = 0, key_count - 1
+    while left <= right:
+        order.append(right)
+        if left != right:
+            order.append(left)
+        left, right = left + 1, right - 1
+    return order
+
+
+def limit_mania_full_chord_runs(hit_object_strings: list[str], key_count: int, max_run: int) -> tuple[list[str], int]:
+    """Break up long runs of full chords (every column at once) in osu!mania.
+
+    The model sometimes gets stuck repeating the same full chord, e.g. dozens of [1234] in a row
+    in 4K. That is easy to play by mashing, yet inflates density and star rating. After `max_run`
+    full chords in a row, the next full chord loses one normal note, cycling through the columns,
+    which turns a run into split chordjack: [1234][123][1234][234][1234][134]... for max_run=1.
+    Hold notes are never removed.
+
+    Returns the new hit object strings and the number of notes removed.
+    """
+    if max_run <= 0:
+        return hit_object_strings, 0
+
+    chords: dict[int, list[int]] = {}
+    columns: list[int] = []
+    holds: list[bool] = []
+    for i, s in enumerate(hit_object_strings):
+        parts = s.split(",")
+        columns.append(min(max(int(float(parts[0]) * key_count / 512), 0), key_count - 1))
+        holds.append(bool(int(parts[3]) & 128))
+        chords.setdefault(int(parts[2]), []).append(i)
+
+    order = full_chord_drop_order(key_count)
+    next_drop = 0
+    run = 0
+    removed: set[int] = set()
+    for time in sorted(chords):
+        indices = chords[time]
+        if len({columns[i] for i in indices}) < key_count:
+            run = 0
+            continue
+        run += 1
+        if run <= max_run:
+            continue
+        for k in range(len(order)):
+            column = order[(next_drop + k) % len(order)]
+            candidates = [i for i in indices if columns[i] == column and not holds[i]]
+            if candidates:
+                removed.add(candidates[0])
+                next_drop = (next_drop + k + 1) % len(order)
+                run = 0
+                break
+
+    return [s for i, s in enumerate(hit_object_strings) if i not in removed], len(removed)
+
+
 def position_to_progress(slider_path: SliderPath, pos: np.ndarray) -> np.ndarray:
     eps = 1e-4
     lr = 1
@@ -194,6 +253,7 @@ class Postprocessor(object):
         self.end_time = args.end_time
         self.has_sv = args.train.data.add_sv
         self.snap_near_perfect_overlaps_enabled = args.snap_near_perfect_overlaps
+        self.mania_max_full_chord_run = getattr(args, "mania_max_full_chord_run", 0) or 0
 
         self.logger = logging.getLogger(__name__) if logger is None else logger.getChild(__name__)
 
@@ -536,6 +596,11 @@ class Postprocessor(object):
                 hit_object_strings, int(beatmap_config.circle_size), beat_length_at)
             if fixes > 0:
                 self.logger.info(f"Fixed {fixes} overlapping objects in mania columns")
+
+            hit_object_strings, removed = limit_mania_full_chord_runs(
+                hit_object_strings, int(beatmap_config.circle_size), self.mania_max_full_chord_run)
+            if removed > 0:
+                self.logger.info(f"Removed {removed} notes to break up runs of full chords")
 
         # Write .osu file
         with open(OSU_TEMPLATE_PATH, "r", encoding="utf-8") as tf:
