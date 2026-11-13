@@ -388,6 +388,22 @@ During inference, you can specify the LoRA weights to use with the `lora_path` a
 This can be a local path or a Hugging Face repo.
 The training checkpoint writes a `mapperatorinator_lora_metadata.json` file into the LoRA folder, and inference reads it to skip incompatible LoRAs automatically when the current model checkpoint subfolder does not match.
 
+## Timing benchmark
+
+`timing_benchmark.py` measures how well generated timing matches human timing on held-out ranked songs from the training dataset's test shards. It uses songs whose human timing has a single BPM, downloads them once into `benchmarks/` (ignored by git), runs `inference.py` on each one, and reports:
+
+- on how many songs the generated timing is exactly one red line at the right BPM,
+- how many red lines were generated in total (the human maps have one each),
+- the median and mean absolute distance from each human beat to the nearest generated beat.
+
+```sh
+python timing_benchmark.py --name v32 --num-songs 20
+# Anything after the options is passed to inference.py as a Hydra override
+python timing_benchmark.py --name v32-temp09 --num-songs 20 timing_temperature=0.9
+```
+
+Results are written to `benchmarks/timing_runs/<name>/results.json`. Runs that already have a generated beatmap are reused, so use a new `--name` when you change settings. Each song takes about 20 seconds on an RTX 4080 Laptop GPU, most of it loading the model.
+
 ## See also
 - [Mapper Classifier](./classifier/README.md)
 - [RComplexion](./rcomplexion/README.md)
