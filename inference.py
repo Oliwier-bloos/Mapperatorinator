@@ -3,6 +3,7 @@ import multiprocessing
 import sys
 
 import utils.excepthook  # noqa
+import utils.stdio  # noqa  Non-Latin beatmap titles must not crash redirected output
 import os.path
 import uuid
 from functools import reduce
