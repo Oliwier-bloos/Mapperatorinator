@@ -25,6 +25,7 @@ import argparse
 import json
 import subprocess
 import sys
+import tarfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -133,19 +134,39 @@ def audio_extension(data: bytes) -> str:
     return "mp3"
 
 
+def iter_shard(shard: str):
+    """Yield (key, {extension: bytes}) for each sample of a WebDataset tar shard on the Hub.
+
+    Reads the tar directly instead of going through `datasets`, whose Audio feature needs
+    torchcodec and FFmpeg's shared libraries even when decoding is turned off.
+    """
+    from huggingface_hub import HfFileSystem
+
+    with HfFileSystem().open(f"datasets/{DATASET_REPO}/{shard}", "rb", block_size=8 * 1024 * 1024) as f:
+        with tarfile.open(fileobj=f, mode="r|") as tar:
+            key, sample = None, {}
+            for member in tar:
+                if not member.isfile():
+                    continue
+                name, _, extension = member.name.partition(".")
+                if key is not None and name != key:
+                    yield key, sample
+                    sample = {}
+                key = name
+                sample[extension] = tar.extractfile(member).read()
+            if key is not None:
+                yield key, sample
+
+
 def fetch_songs(data_dir: Path, num_songs: int) -> list[Path]:
     """Download held-out single-BPM songs (original audio + beatmaps) into data_dir."""
     existing = sorted(p for p in data_dir.iterdir() if (p / "meta.json").exists()) if data_dir.exists() else []
     if len(existing) >= num_songs:
         return existing[:num_songs]
 
-    from datasets import load_dataset
     from huggingface_hub import list_repo_files
 
-    def stream(path: str):
-        return load_dataset(DATASET_REPO, data_files=[path], streaming=True, split="train").decode(False)
-
-    first_held_out_key = next(iter(stream(FIRST_HELD_OUT_SHARD)))["__key__"]
+    first_held_out_key = next(iter_shard(FIRST_HELD_OUT_SHARD))[0]
     shards = sorted(f for f in list_repo_files(DATASET_REPO, repo_type="dataset") if f.startswith("original/"))
     data_dir.mkdir(parents=True, exist_ok=True)
     have = {p.name for p in existing}
@@ -153,21 +174,21 @@ def fetch_songs(data_dir: Path, num_songs: int) -> list[Path]:
     for shard in reversed(shards):
         print(f"Reading {shard} ...")
         any_held_out = False
-        for row in stream(shard):
-            key = row["__key__"]
+        for key, sample in iter_shard(shard):
             if key < first_held_out_key:
                 continue
             any_held_out = True
-            if key in have:
+            if key in have or "json" not in sample or "mp3" not in sample:
                 continue
-            beatmap = first_beatmap_with_content(row["json"])
+            meta = json.loads(sample["json"])
+            beatmap = first_beatmap_with_content(meta)
             if beatmap is None or len(red_lines(beatmap["content"])) != 1:
                 continue
-            audio = row["mp3"]["bytes"]
+            audio = sample["mp3"]
             song_dir = data_dir / key
             song_dir.mkdir(exist_ok=True)
             (song_dir / f"original.{audio_extension(audio)}").write_bytes(audio)
-            (song_dir / "meta.json").write_text(json.dumps(row["json"]), encoding="utf-8")
+            (song_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
             have.add(key)
             if len(have) >= num_songs:
                 return sorted(p for p in data_dir.iterdir() if (p / "meta.json").exists())[:num_songs]
