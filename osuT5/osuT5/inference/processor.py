@@ -45,6 +45,46 @@ class GenerationConfig:
     negative_descriptors: Optional[list[str]] = None
 
 
+# Conditions that classifier-free guidance can strengthen: each has an "unknown" token, which
+# the negative prompt uses in place of the requested value.
+CFG_CONDITIONS = ("difficulty", "year", "circle_size", "hold_note_ratio", "scroll_speed_ratio")
+
+
+def negative_generation_config(config: GenerationConfig, cfg_conditions=()) -> GenerationConfig:
+    """Generation config of the negative prompt for classifier-free guidance.
+
+    The negative prompt keeps every condition of the positive prompt except the mapper (when
+    descriptors are used), the descriptors (replaced by the negative descriptors) and the
+    conditions in `cfg_conditions`, which become unknown. CFG then pushes generation towards
+    the requested values of exactly those conditions.
+    """
+    unknown = [name for name in cfg_conditions if name not in CFG_CONDITIONS]
+    if unknown:
+        raise ValueError(f"Unsupported cfg_conditions {unknown}. Supported: {list(CFG_CONDITIONS)}")
+
+    uses_descriptors = bool(config.descriptors) or bool(config.negative_descriptors)
+    negative = GenerationConfig(
+        gamemode=config.gamemode,
+        difficulty=config.difficulty,
+        mapper_id=config.mapper_id if uses_descriptors else None,
+        year=config.year,
+        hp_drain_rate=config.hp_drain_rate,
+        circle_size=config.circle_size,
+        overall_difficulty=config.overall_difficulty,
+        approach_rate=config.approach_rate,
+        slider_multiplier=config.slider_multiplier,
+        slider_tick_rate=config.slider_tick_rate,
+        hitsounded=config.hitsounded,
+        keycount=config.keycount,
+        hold_note_ratio=config.hold_note_ratio,
+        scroll_speed_ratio=config.scroll_speed_ratio,
+        descriptors=config.negative_descriptors,
+    )
+    for name in cfg_conditions:
+        setattr(negative, name, None)
+    return negative
+
+
 # noinspection PyProtectedMember
 def generation_config_from_beatmap(beatmap: Beatmap, beatmap_path, tokenizer: Optional[Tokenizer] = None) -> GenerationConfig:
     gamemode = int(beatmap.mode)
@@ -139,6 +179,8 @@ class Processor(object):
             self.x_count = self.x_max - self.x_min + 1
 
         self.cfg_scale = cfg_scale or args.cfg_scale
+        self.cfg_conditions = list(getattr(args, "cfg_conditions", None) or [])
+        negative_generation_config(GenerationConfig(), self.cfg_conditions)  # Validate the names early
         self.top_p = args.top_p
         self.top_k = args.top_k
         self.temperature = args.temperature
@@ -969,23 +1011,8 @@ class Processor(object):
             # Add class vector to the first out context
             if i == 0:
                 context_data["class"] = self.get_class_vector(generation_config, song_length, verbose=verbose)
-                context_data["negative_class"] = self.get_class_vector(GenerationConfig(
-                    gamemode=generation_config.gamemode,
-                    difficulty=generation_config.difficulty,
-                    mapper_id=generation_config.mapper_id if (generation_config.descriptors and len(generation_config.descriptors) > 0) or (generation_config.negative_descriptors and len(generation_config.negative_descriptors) > 0) else None,
-                    year=generation_config.year,
-                    hp_drain_rate=generation_config.hp_drain_rate,
-                    circle_size=generation_config.circle_size,
-                    overall_difficulty=generation_config.overall_difficulty,
-                    approach_rate=generation_config.approach_rate,
-                    slider_multiplier=generation_config.slider_multiplier,
-                    slider_tick_rate=generation_config.slider_tick_rate,
-                    hitsounded=generation_config.hitsounded,
-                    keycount=generation_config.keycount,
-                    hold_note_ratio=generation_config.hold_note_ratio,
-                    scroll_speed_ratio=generation_config.scroll_speed_ratio,
-                    descriptors=generation_config.negative_descriptors,
-                ), song_length)
+                context_data["negative_class"] = self.get_class_vector(
+                    negative_generation_config(generation_config, self.cfg_conditions), song_length)
                 context_data["add_pre_tokens"] = self.add_pre_tokens
 
             out.append(context_data)

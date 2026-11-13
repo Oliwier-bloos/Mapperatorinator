@@ -57,6 +57,7 @@ class InferenceConfig:
     in_context: list[ContextType] = field(default_factory=lambda: [ContextType.NONE])  # Context types of other beatmap(s)
     output_type: list[ContextType] = field(default_factory=lambda: [ContextType.MAP])  # Output type (map, timing)
     cfg_scale: float = 1.0  # Scale of classifier-free guidance
+    cfg_conditions: list[str] = field(default_factory=list)  # Conditions CFG strengthens when cfg_scale > 1 (difficulty, year, circle_size, hold_note_ratio, scroll_speed_ratio)
     temperature: float = 1.0  # Sampling temperature
     timing_temperature: float = 0.1  # Sampling temperature for timing
     mania_column_temperature: float = 0.5  # Sampling temperature for mania columns

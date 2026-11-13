@@ -44,6 +44,7 @@ timing_leniency: 20     # Number of milliseconds of error to allow for timing ge
 in_context: [NONE]          # Context types of other beatmap(s)
 output_type: [MAP]    # Output type (map, timing)
 cfg_scale: 1.0              # Scale of classifier-free guidance
+cfg_conditions: []          # Conditions CFG strengthens when cfg_scale > 1: any of difficulty, year, circle_size, hold_note_ratio, scroll_speed_ratio
 temperature: 1.0        # Sampling temperature
 timing_temperature: 0.1 # Sampling temperature for timing
 mania_column_temperature: 0.8 # Sampling temperature for mania columns
