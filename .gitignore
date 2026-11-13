@@ -3,6 +3,7 @@ __pycache__
 logs
 logs_fid
 benchmarks
+mania_maps
 multirun
 tensorboard_logs
 .idea

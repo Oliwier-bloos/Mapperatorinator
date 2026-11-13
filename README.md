@@ -388,6 +388,24 @@ During inference, you can specify the LoRA weights to use with the `lora_path` a
 This can be a local path or a Hugging Face repo.
 The training checkpoint writes a `mapperatorinator_lora_metadata.json` file into the LoRA folder, and inference reads it to skip incompatible LoRAs automatically when the current model checkpoint subfolder does not match.
 
+## One-command mania maps
+
+`mania_generate.py` turns a song into one osu!mania map, picking the best of several tries:
+
+```sh
+python mania_generate.py "C:/Users/me/Downloads/song.m4a" --max-stars 7
+# Steer the style with tags, and away from others
+python mania_generate.py song.mp3 --tags style/chordjack skillset/speedjack --avoid-tags style/jumpstream style/handstream
+```
+
+1. Converts the audio to MP3 (needs `ffmpeg` on PATH).
+2. Generates the timing three times and keeps the version most runs agree on, dropping red lines after the music fades out. `--double-bpm` doubles the BPM for songs whose tempo is ambiguous; `--timing my.osu` uses your own timing instead.
+3. Generates candidates in parallel: two difficulty requests (1 and 0.5 stars below `--max-stars`, since how many stars a request gives varies by song) times two seeds, at temperature 0.7 and column temperature 0.5. Higher temperatures make patterns feel random.
+4. Scores each candidate (star rating, notes finer than 1/4, how often beat patterns repeat, density spikes, invalid notes) and prints a table.
+5. Keeps the best one under the cap, preferring no density spike and the most pattern structure, and writes it as an `.osz` next to the song. Double-click it to import into osu!.
+
+Work files go to `mania_maps/<title>/` (ignored by git). Each candidate takes a few minutes on an RTX 4080 Laptop GPU; `--parallel` sets how many run at once (3 by default).
+
 ## Timing benchmark
 
 `timing_benchmark.py` measures how well generated timing matches human timing on held-out ranked songs from the training dataset's test shards. It uses songs whose human timing has a single BPM, downloads them once into `benchmarks/` (ignored by git), runs `inference.py` on each one, and reports:

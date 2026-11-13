@@ -23,6 +23,7 @@ Metrics (generated vs. human reference, over the same window):
     holds           share of hold notes
     chords_3plus    share of chords with 3 or more notes
     jack_rate       share of notes on a column that the previous chord also used
+    repetition      share of beats whose note pattern repeats or mirrors one of the previous 8
     invalid         notes overlapping or stacked in the same column (should be 0)
     bpm_correct     every generated red line in the window is within 0.5 BPM of the human BPM
 """
@@ -115,6 +116,40 @@ def pattern_stats(notes: list[Note], keys: int) -> dict:
     }
 
 
+def pattern_repetition(osu_text: str, keys: int, start: float = -np.inf, end: float = np.inf,
+                       lookback: int = 8) -> float:
+    """Share of beats whose note pattern repeats, or mirrors, one of the previous `lookback` beats.
+
+    A beat's pattern is the set of (position in the beat at 1/8 resolution, columns hit). Human
+    maps repeat and mirror motifs with the music; randomly placed notes rarely do. A map a player
+    praised scored 59%, one that felt like "randomized notes" scored 13%, and ranked human 4K maps
+    around 4 stars average 17%.
+    """
+    reds = red_lines(osu_text)
+    notes = parse_notes(osu_text, keys, start, end)
+    if not reds or not notes:
+        return 0.0
+    beats: dict[int, dict[int, set[int]]] = {}
+    for n in notes:
+        governing = [r for r in reds if r[0] <= n.time + 1]
+        offset, beat_length = governing[-1] if governing else reds[0]
+        position = (n.time - offset) / beat_length
+        beat = int(np.floor(position + 1e-3))
+        slot = int(round((position - beat) * 8)) % 8
+        beats.setdefault(beat, {}).setdefault(slot, set()).add(n.column)
+    patterns = {b: frozenset((s, frozenset(c)) for s, c in slots.items()) for b, slots in beats.items()}
+
+    def mirrored(pattern):
+        return frozenset((s, frozenset(keys - 1 - c for c in cols)) for s, cols in pattern)
+
+    repeated = 0
+    for b, pattern in patterns.items():
+        recent = [patterns[k] for k in range(b - lookback, b) if k in patterns]
+        if pattern in recent or mirrored(pattern) in recent:
+            repeated += 1
+    return repeated / len(patterns)
+
+
 def hold_ratio(osu_text: str, keys: int) -> float:
     notes = parse_notes(osu_text, keys)
     return sum(1 for n in notes if n.end > n.time) / max(1, len(notes))
@@ -175,6 +210,8 @@ def score_song(song: str, reference_id: int, human_osu: str, generated_osu: str,
     pair_f1 = None
     if other_human_osu is not None:
         pair_f1 = onset_f1([n.time for n in human_notes], [n.time for n in parse_notes(other_human_osu, keys, start, end)])
+    human_stats = pattern_stats(human_notes, keys) | {"repetition": pattern_repetition(human_osu, keys, start, end)}
+    generated_stats = pattern_stats(generated_notes, keys) | {"repetition": pattern_repetition(generated_osu, keys, start, end)}
     return SongResult(
         song=song,
         reference_beatmap_id=reference_id,
@@ -183,8 +220,8 @@ def score_song(song: str, reference_id: int, human_osu: str, generated_osu: str,
         onset_f1=onset_f1([n.time for n in human_notes], [n.time for n in generated_notes]),
         human_pair_f1=pair_f1,
         bpm_correct=bpm_correct(human_osu, generated_osu, start, end),
-        human=pattern_stats(human_notes, keys),
-        generated=pattern_stats(generated_notes, keys),
+        human=human_stats,
+        generated=generated_stats,
     )
 
 
@@ -202,7 +239,7 @@ def summarize(results: list[SongResult]) -> dict:
         "bpm_correct": sum(r.bpm_correct for r in results),
         "invalid_notes": sum(r.generated["invalid"] for r in results),
     }
-    for key in ["notes", "holds", "chords_3plus", "jack_rate"]:
+    for key in ["notes", "holds", "chords_3plus", "jack_rate", "repetition"]:
         summary[f"human_{key}"] = mean([r.human[key] for r in results])
         summary[f"generated_{key}"] = mean([r.generated[key] for r in results])
     return summary
@@ -359,6 +396,7 @@ def main():
         print(f"  holds               {s['human_holds']:.0%} -> {s['generated_holds']:.0%}   (mean error {s['hold_ratio_error']:.0%})")
         print(f"  3+ note chords      {s['human_chords_3plus']:.0%} -> {s['generated_chords_3plus']:.0%}")
         print(f"  jacks               {s['human_jack_rate']:.0%} -> {s['generated_jack_rate']:.0%}")
+        print(f"  pattern repetition  {s['human_repetition']:.0%} -> {s['generated_repetition']:.0%}")
         print(f"  BPM correct         {s['bpm_correct']}/{s['songs']}")
         print(f"  invalid notes       {s['invalid_notes']}")
     run_dir.mkdir(parents=True, exist_ok=True)
