@@ -103,6 +103,62 @@ def calculate_coordinates(last_pos, dist, num_samples, playfield_size):
     return coordinates
 
 
+def fix_mania_column_overlaps(hit_object_strings: list[str], key_count: int, beat_length_at) -> tuple[list[str], int]:
+    """Make sure no two osu!mania objects overlap in the same column.
+
+    - Objects at the same time in the same column are merged into one (a hold note wins).
+    - When an object starts before (or exactly when) the hold note before it in its column ends,
+      the hold note is shortened to end a quarter beat before that object. If that leaves less
+      than an eighth of a beat, it becomes a normal note.
+
+    `beat_length_at(time_ms)` gives the beat length in ms at a time. Returns the fixed hit object
+    strings and the number of objects that were changed or removed.
+    """
+    parsed = []
+    for s in hit_object_strings:
+        parts = s.split(",")
+        x, time, kind = float(parts[0]), int(parts[2]), int(parts[3])
+        is_hold = bool(kind & 128)
+        end = int(parts[5].split(":", 1)[0]) if is_hold else time
+        column = min(max(int(x * key_count / 512), 0), key_count - 1)
+        parsed.append({"parts": parts, "time": time, "end": end, "hold": is_hold, "column": column})
+
+    fixes = 0
+    kept = []
+    for column in range(key_count):
+        objects = sorted((o for o in parsed if o["column"] == column), key=lambda o: (o["time"], not o["hold"]))
+        column_kept = []
+        for obj in objects:
+            if column_kept and obj["time"] == column_kept[-1]["time"]:
+                fixes += 1  # Stacked on the previous object; the sort put a hold note first
+                continue
+            if column_kept and column_kept[-1]["hold"] and obj["time"] <= column_kept[-1]["end"]:
+                prev = column_kept[-1]
+                beat = beat_length_at(obj["time"])
+                new_end = int(round(obj["time"] - beat / 4))
+                if new_end - prev["time"] < beat / 8:
+                    prev["hold"] = False
+                    prev["end"] = prev["time"]
+                else:
+                    prev["end"] = new_end
+                fixes += 1
+            column_kept.append(obj)
+        kept.extend(column_kept)
+
+    result = []
+    for o in sorted(kept, key=lambda o: o["time"]):
+        parts = list(o["parts"])
+        was_hold = bool(int(parts[3]) & 128)
+        if was_hold and not o["hold"]:
+            # Hold note turned into a normal note: drop the end time from the hit sample
+            parts[3] = "1"
+            parts[5] = parts[5].split(":", 1)[1]
+        elif o["hold"]:
+            parts[5] = f"{o['end']}:" + parts[5].split(":", 1)[1]
+        result.append(",".join(parts))
+    return result, fixes
+
+
 def position_to_progress(slider_path: SliderPath, pos: np.ndarray) -> np.ndarray:
     eps = 1e-4
     lr = 1
@@ -467,6 +523,19 @@ class Postprocessor(object):
         # Holds are completed in end-time order, which may differ from their
         # start-time order when different columns overlap.
         hit_object_strings.sort(key=lambda hit_object: int(hit_object.split(",", 3)[2]))
+
+        if beatmap_config.mode == 3:
+            redlines = [tp for tp in timing if tp.parent is None]
+
+            def beat_length_at(time_ms: int) -> float:
+                if not redlines:
+                    return self.beat_length
+                return self.timing_point_at(timedelta(milliseconds=time_ms), redlines).ms_per_beat
+
+            hit_object_strings, fixes = fix_mania_column_overlaps(
+                hit_object_strings, int(beatmap_config.circle_size), beat_length_at)
+            if fixes > 0:
+                self.logger.info(f"Fixed {fixes} overlapping objects in mania columns")
 
         # Write .osu file
         with open(OSU_TEMPLATE_PATH, "r", encoding="utf-8") as tf:
