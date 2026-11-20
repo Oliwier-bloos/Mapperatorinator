@@ -8,7 +8,11 @@ Steps:
 3. Generate candidate maps in parallel, one per seed x temperature.
 4. Score every candidate: star rating, how many notes are finer than 1/4, how often beat patterns
    repeat (structure), density spikes and invalid notes.
-5. Keep the best one under --max-stars and write it as an .osz next to the song.
+5. Keep the best one under --max-stars.
+6. Find sections much harder than the rest of that map (bursts of quarter-beat jacks, or
+   density spikes) and regenerate just those sections with a few more seeds, keeping a version
+   without the spike. --no-fix-spikes skips this.
+7. Write the map as an .osz next to the song.
 
 Example:
     python mania_generate.py "C:/Users/me/Downloads/song.m4a" --max-stars 7
@@ -138,6 +142,83 @@ def density_spike(osu_text: str, keys: int) -> float:
     return max(counts) / float(np.median(counts))
 
 
+@dataclass
+class Spike:
+    start: int        # ms
+    end: int          # ms
+    fast_jacks: int   # most quarter-beat (or faster) same-column repeats in one of its sections
+    notes: int        # most notes in one of its sections
+    reason: str
+
+
+def section_stats(osu_text: str, keys: int, section_ms: int = SECTION_MS) -> list[tuple[int, int, int]]:
+    """(start ms, notes, fast jacks) for consecutive sections from the first note.
+
+    A fast jack is a note hit on the same column as the previous note in that column, at most a
+    quarter beat later.
+    """
+    reds = red_lines(osu_text)
+    notes = parse_notes(osu_text, keys)
+    if not reds or not notes:
+        return []
+
+    def beat_at(t):
+        governing = [r for r in reds if r[0] <= t + 1]
+        return (governing[-1] if governing else reds[0])[1]
+
+    jack_times = []
+    for column in range(keys):
+        times = [n.time for n in notes if n.column == column]
+        jack_times += [b for a, b in zip(times, times[1:]) if b - a <= beat_at(a) / 4 + 2]
+    note_times = np.array([n.time for n in notes])
+    jack_times = np.array(sorted(jack_times))
+    stats = []
+    for s in range(notes[0].time, notes[-1].time + 1, section_ms):
+        count = int(((note_times >= s) & (note_times < s + section_ms)).sum())
+        jacks = int(((jack_times >= s) & (jack_times < s + section_ms)).sum())
+        stats.append((s, count, jacks))
+    return stats
+
+
+def find_spikes(osu_text: str, keys: int, jack_floor: int = 20, jack_ratio: float = 3.0,
+                density_ratio: float = 1.35, section_ms: int = SECTION_MS) -> list[Spike]:
+    """Sections far harder than the rest of the map, merged into regions.
+
+    Flags a section when its fast jacks reach `jack_floor` and `jack_ratio` times the map's median,
+    or its note count is over `density_ratio` times the median. Measuring against the map itself
+    keeps a map that is speedjack all the way through from counting as one long spike.
+    """
+    stats = section_stats(osu_text, keys, section_ms)
+    active = [st for st in stats if st[1] > 0]
+    if len(active) < 3:
+        return []
+    median_notes = float(np.median([n for _, n, _ in active]))
+    median_jacks = float(np.median([j for _, _, j in active]))
+    jack_limit = max(jack_floor, jack_ratio * median_jacks)
+
+    flagged = []
+    for start, count, jacks in stats:
+        reasons = []
+        if jacks >= jack_limit:
+            reasons.append("jack burst")
+        if count > density_ratio * median_notes:
+            reasons.append("density")
+        if reasons:
+            flagged.append((start, count, jacks, reasons))
+
+    spikes: list[Spike] = []
+    for start, count, jacks, reasons in flagged:
+        if spikes and start <= spikes[-1].end:
+            last = spikes[-1]
+            last.end = start + section_ms
+            last.fast_jacks = max(last.fast_jacks, jacks)
+            last.notes = max(last.notes, count)
+            last.reason = " + ".join(sorted(set(last.reason.split(" + ") + reasons)))
+        else:
+            spikes.append(Spike(start, start + section_ms, jacks, count, " + ".join(reasons)))
+    return spikes
+
+
 def describe(name: str, path: Path, keys: int) -> Candidate:
     text = path.read_text(encoding="utf-8")
     notes = parse_notes(text, keys)
@@ -196,7 +277,8 @@ def run_parallel(jobs: list[tuple[str, list[str], Path]], parallel: int) -> dict
             if existing:
                 results[name] = existing[0]
                 continue
-            proc = run_inference(overrides + [f"output_path={out_dir}", f"hydra.run.dir={out_dir / 'hydra'}"],
+            proc = run_inference(overrides + [f"output_path={hydra_string(str(out_dir))}",
+                                              f"hydra.run.dir={hydra_string(str(out_dir / 'hydra'))}"],
                                  out_dir / "inference.log")
             running.append((name, proc, out_dir))
         for item in list(running):
@@ -212,11 +294,69 @@ def run_parallel(jobs: list[tuple[str, list[str], Path]], parallel: int) -> dict
 
 
 def hydra_string(value: str) -> str:
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    """Quote a value for a Hydra override.
+
+    Inside quotes Hydra keeps backslashes literally (so Windows paths pass through as they are),
+    except before a quote: there they must be doubled, and the quote itself escaped.
+    """
+    escaped = re.sub(r'(\\*)"', lambda m: m.group(1) * 2 + '\\"', value)
+    escaped = re.sub(r"(\\+)$", lambda m: m.group(1) * 2, escaped)
+    return '"' + escaped + '"'
 
 
 def hydra_list(values: list[str]) -> str:
     return "[" + ",".join(hydra_string(v) for v in values) + "]"
+
+
+def with_overrides(overrides: list[str], **values) -> list[str]:
+    """Replace (or add) Hydra overrides; Hydra rejects a key given twice."""
+    kept = [o for o in overrides if o.split("=", 1)[0] not in values]
+    return kept + [f"{key}={value}" for key, value in values.items()]
+
+
+def mmss(ms: float) -> str:
+    return f"{int(ms // 60000)}:{int(ms // 1000) % 60:02d}"
+
+
+def fix_spikes(map_path: Path, overrides: list[str], work: Path, keys: int, seeds: list[int], parallel: int,
+               min_stars: float, max_stars: float, max_fixes: int) -> tuple[Path, list[dict]]:
+    """Regenerate each spike region of a map with several seeds and keep a version without it.
+
+    Returns the final map and a log of what happened to each spike.
+    """
+    log = []
+    current = map_path
+    for i, spike in enumerate(find_spikes(current.read_text(encoding="utf-8"), keys)[:max_fixes]):
+        print(f"Spike at {mmss(spike.start)}-{mmss(spike.end)}: {spike.reason} "
+              f"({spike.fast_jacks} fast jacks, {spike.notes} notes in 6 s). Regenerating it with {len(seeds)} seeds ...")
+        base = work / f"fix{i}_base.osu"
+        shutil.copyfile(current, base)
+        jobs = [(f"fix {i} seed {s}",
+                 with_overrides(overrides, beatmap_path=hydra_string(str(base)), add_to_beatmap="true",
+                                start_time=spike.start, end_time=spike.end, seed=s),
+                 work / f"fix{i}_s{s}") for s in seeds]
+        options = []
+        for name, path in run_parallel(jobs, parallel).items():
+            if not path:
+                continue
+            text = path.read_text(encoding="utf-8")
+            remaining = [sp for sp in find_spikes(text, keys) if sp.start < spike.end and sp.end > spike.start]
+            jacks = sum(j for s, _, j in section_stats(text, keys) if spike.start <= s < spike.end)
+            stars = star_rating(text)
+            options.append({"name": name, "path": path, "resolved": not remaining, "fast_jacks": jacks, "stars": stars,
+                            "in_range": min_stars - 0.05 <= stars <= max_stars + 0.05})
+        resolved = [o for o in options if o["resolved"]]
+        entry = {"start": spike.start, "end": spike.end, "reason": spike.reason, "fast_jacks": spike.fast_jacks,
+                 "notes": spike.notes, "fixed_with": None}
+        if resolved:
+            pick = max(resolved, key=lambda o: (o["in_range"], -o["fast_jacks"]))
+            current = pick["path"]
+            entry["fixed_with"] = pick["name"]
+            print(f"  fixed with {pick['name']}: {pick['fast_jacks']} fast jacks there now, map {pick['stars']:.2f} stars")
+        else:
+            print("  no seed removed it; kept the original section")
+        log.append(entry)
+    return current, log
 
 
 # --- Packaging ----------------------------------------------------------------------------
@@ -267,6 +407,10 @@ def main():
     parser.add_argument("--artist", default="Unknown Artist")
     parser.add_argument("--out", type=Path, default=None, help="Folder for the .osz (default: next to the audio)")
     parser.add_argument("--work-dir", type=Path, default=None, help="Default: mania_maps/<title>")
+    parser.add_argument("--no-fix-spikes", action="store_true",
+                        help="Don't regenerate sections much harder than the rest of the map")
+    parser.add_argument("--fix-seeds", type=int, nargs="+", default=[3, 4, 5], help="Seeds to try on each spike")
+    parser.add_argument("--max-fixes", type=int, default=3, help="Most spike regions to regenerate")
     args, extra = parser.parse_known_args()
 
     title = args.title or title_from_filename(args.audio)
@@ -287,7 +431,7 @@ def main():
     end_ms = music_end_ms(load_audio_file(str(audio), 16000), 16000)
     print(f"{title}: music ends at {end_ms / 1000:.1f} s")
 
-    common = [f"audio_path={audio}", "gamemode=3", f"keycount={args.keys}", "year=2024"]
+    common = [f"audio_path={hydra_string(str(audio))}", "gamemode=3", f"keycount={args.keys}", "year=2024"]
 
     # 2. Timing
     timing_path = work / "timing.osu"
@@ -311,7 +455,7 @@ def main():
 
     # 3. Candidates
     map_overrides = common + [
-        f"beatmap_path={timing_path}", "in_context=[TIMING]", "output_type=[MAP]",
+        f"beatmap_path={hydra_string(str(timing_path))}", "in_context=[TIMING]", "output_type=[MAP]",
         f"hold_note_ratio={args.holds}", "mania_max_full_chord_run=1", f"end_time={end_ms + 500}",
         f"title={hydra_string(title)}", f"artist={hydra_string(args.artist)}", "creator=Mapperatorinator",
         f"cfg_scale={args.cfg_scale}", "cfg_conditions=[difficulty]" if args.cfg_scale > 1 else "cfg_conditions=[]",
@@ -346,15 +490,28 @@ def main():
               f"{c.spike:6.2f} {c.holds:6.0%} {c.chords_3plus:5.0%} {c.jack_rate:6.0%}{mark}")
     print(f"Picked {best.name}: {reason}")
 
-    # 5. Package
+    # 5. Fix sections much harder than the rest of the map
+    final_path, fixes = Path(best.path), []
+    if not args.no_fix_spikes:
+        overrides = next(o for name, o, _ in jobs if name == best.name)
+        min_stars = args.min_stars if args.min_stars is not None else args.max_stars - 1.0
+        final_path, fixes = fix_spikes(final_path, overrides, work, args.keys, args.fix_seeds, args.parallel,
+                                       min_stars, args.max_stars, args.max_fixes)
+        if not fixes:
+            print("No spikes: no section is much harder than the rest of the map")
+    final = describe(best.name, final_path, args.keys)
+
+    # 6. Package
     out_dir = args.out or args.audio.parent
-    version = f"{args.keys}K {best.stars:.2f}"
+    version = f"{args.keys}K {final.stars:.2f}"
     osz = out_dir / f"{safe_filename(title)} (Mapperatorinator {version}).osz"
     if osz.exists():
         osz = osz.with_name(osz.stem + f" {best.name}.osz")
-    package_osz(osz, audio, Path(best.path), version)
-    (work / "candidates.json").write_text(json.dumps({"picked": best.name, "reason": reason,
-                                                      "candidates": [asdict(c) for c in candidates]}, indent=1))
+    package_osz(osz, audio, final_path, version)
+    (work / "candidates.json").write_text(json.dumps({
+        "picked": best.name, "reason": reason, "spike_fixes": fixes, "final": asdict(final),
+        "candidates": [asdict(c) for c in candidates]}, indent=1, default=str))
+    print(f"Final map: {final.stars:.2f} stars, {final.notes_per_s:.1f} notes/s, {final.repetition:.0%} repetition")
     print(f"Wrote {osz}")
 
 

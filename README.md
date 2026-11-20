@@ -402,7 +402,9 @@ python mania_generate.py song.mp3 --tags style/chordjack skillset/speedjack --av
 2. Generates the timing three times and keeps the version most runs agree on, dropping red lines after the music fades out. `--double-bpm` doubles the BPM for songs whose tempo is ambiguous; `--timing my.osu` uses your own timing instead.
 3. Generates candidates in parallel: two difficulty requests (1 and 0.5 stars below `--max-stars`, since how many stars a request gives varies by song) times two seeds, at temperature 0.7 and column temperature 0.5. Higher temperatures make patterns feel random.
 4. Scores each candidate (star rating, notes finer than 1/4, how often beat patterns repeat, density spikes, invalid notes) and prints a table.
-5. Keeps the best one under the cap, preferring no density spike and the most pattern structure, and writes it as an `.osz` next to the song. Double-click it to import into osu!.
+5. Keeps the best one under the cap (and above `--min-stars`, if given), preferring no density spike and the most pattern structure.
+6. Looks for sections much harder than the rest of that map: bursts of quarter-beat jacks (at least 20 in 6 seconds and 3× the map's typical amount, so a map that is speedjack throughout isn't flagged) or note density over 1.35× the typical section. Each is regenerated on its own with three more seeds, keeping a version without the spike. `--no-fix-spikes` turns this off.
+7. Writes the map as an `.osz` next to the song. Double-click it to import into osu!.
 
 Work files go to `mania_maps/<title>/` (ignored by git). Each candidate takes a few minutes on an RTX 4080 Laptop GPU; `--parallel` sets how many run at once (3 by default).
 

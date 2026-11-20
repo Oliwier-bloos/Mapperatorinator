@@ -6,12 +6,16 @@ from mania_generate import (
     consensus_timing,
     density_spike,
     double_bpm,
+    find_spikes,
     finer_than_quarter,
     hydra_list,
+    hydra_string,
     music_end_ms,
+    section_stats,
     select,
     title_from_filename,
     trim_timing_after,
+    with_overrides,
 )
 from mania_benchmark import pattern_repetition
 from timing_benchmark import red_lines
@@ -124,3 +128,65 @@ def test_helpers():
     assert title_from_filename(Path("tick-tack-819830653.m4a")) == "tick-tack"
     assert title_from_filename(Path("SHAKE!THE!CITY!-816623178.m4a")) == "SHAKE!THE!CITY!"
     assert hydra_list(["style/LN density", 'a"b']) == '["style/LN density","a\\"b"]'
+
+
+# --- Spike detection ------------------------------------------------------------------------
+# 120 BPM: a beat is 500 ms, a quarter beat 125 ms, a 6 s section holds 48 quarter-beat steps.
+
+def stream(start, steps):
+    """Rolling 1/4 stream: each column comes back every beat, so no fast jacks."""
+    return [note(i % 4, start + 125 * i) for i in range(steps)]
+
+
+def jacky(start, steps):
+    """Each column hit twice in a row at 1/4: a fast jack every other note."""
+    return [note((i // 2) % 4, start + 125 * i) for i in range(steps)]
+
+
+def test_section_stats_counts_fast_jacks():
+    stats = section_stats(osu(RED_120, jacky(1000, 48)), 4)
+    assert stats[0] == (1000, 48, 24)
+
+
+def test_jack_burst_is_flagged():
+    objects = stream(1000, 48 * 4) + jacky(1000 + 6000 * 4, 48) + stream(1000 + 6000 * 5, 48 * 4)
+    spikes = find_spikes(osu(RED_120, objects), 4)
+    assert len(spikes) == 1
+    assert (spikes[0].start, spikes[0].end) == (25000, 31000)
+    assert spikes[0].reason == "jack burst" and spikes[0].fast_jacks >= 20
+
+
+def test_speedjack_all_the_way_is_not_a_spike():
+    assert find_spikes(osu(RED_120, jacky(1000, 48 * 8)), 4) == []
+
+
+def test_density_spike_is_flagged():
+    chords = [n for i in range(48) for n in (note(i % 2, 25000 + 125 * i), note(2 + i % 2, 25000 + 125 * i))]
+    objects = stream(1000, 48 * 4) + chords + stream(31000, 48 * 4)
+    spikes = find_spikes(osu(RED_120, objects), 4)
+    assert len(spikes) == 1 and spikes[0].reason == "density"
+
+
+def test_adjacent_spike_sections_merge():
+    objects = stream(1000, 48 * 4) + jacky(25000, 96) + stream(37000, 48 * 4)
+    spikes = find_spikes(osu(RED_120, objects), 4)
+    assert [(s.start, s.end) for s in spikes] == [(25000, 37000)]
+
+
+def test_with_overrides_replaces_keys():
+    result = with_overrides(["seed=0", "end_time=9", "keycount=4"], seed=3, start_time=1)
+    assert result == ["end_time=9", "keycount=4", "seed=3", "start_time=1"]
+
+
+@pytest.mark.parametrize("value", [
+    r"C:\Users\me\mania_maps\Rude Buster (Camellia Remix)\timing.osu",
+    "C:/Users/me/Downloads/SHAKE!THE!CITY! [x], y=z.mp3",
+    'a title with "quotes"',
+    "ends with a backslash\\",
+    'backslash before quote\\"x',
+])
+def test_quoted_values_parse_in_hydra(value):
+    from hydra.core.override_parser.overrides_parser import OverridesParser
+
+    override = OverridesParser.create().parse_overrides([f"key={hydra_string(value)}"])[0]
+    assert override.value() == value
