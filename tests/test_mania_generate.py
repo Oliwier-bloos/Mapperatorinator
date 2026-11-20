@@ -10,9 +10,13 @@ from mania_generate import (
     finer_than_quarter,
     hydra_list,
     hydra_string,
+    loudest_window,
     music_end_ms,
+    pick_difficulty,
+    rhythm_stats,
     section_stats,
     select,
+    style_score,
     title_from_filename,
     trim_timing_after,
     with_overrides,
@@ -190,3 +194,50 @@ def test_quoted_values_parse_in_hydra(value):
 
     override = OverridesParser.create().parse_overrides([f"key={hydra_string(value)}"])[0]
     assert override.value() == value
+
+
+# --- Style-aware picking and preview ----------------------------------------------------------
+
+def test_rhythm_stats_stream_vs_changing_rhythm():
+    stream_map = osu(RED_120, stream(1000, 64))
+    assert rhythm_stats(stream_map, 4) == (pytest.approx(1.0), 0.0)
+    # Gaps cycle 1/4, 1/6, 1/2, 1/3: the rhythm changes on every note and never runs
+    t, notes = 1000, []
+    for i in range(64):
+        notes.append(note(i % 4, int(t)))
+        t += [125, 500 / 6, 250, 500 / 3][i % 4]
+    monotone, changes = rhythm_stats(osu(RED_120, notes), 4)
+    assert monotone == 0 and changes == pytest.approx(1.0)
+
+
+def test_style_scores():
+    c = Candidate("x", "", 6.8, 20, 0.2, 0.3, 1.1, 0, 0.1, 0.25, 0, monotone=0.4, rhythm_changes=0.3)
+    assert style_score(c, "tech") == pytest.approx(-0.1)
+    assert style_score(c, "jacks") == 0.25
+    assert style_score(c, "any") == 0.3
+
+
+def test_select_tech_prefers_changing_rhythm_over_repetition():
+    streamy = Candidate("streamy", "", 6.8, 20, 0.1, 0.5, 1.1, 0, 0.1, 0.1, 0, monotone=0.8, rhythm_changes=0.1)
+    techy = Candidate("techy", "", 6.7, 20, 0.3, 0.2, 1.1, 0, 0.1, 0.1, 0, monotone=0.3, rhythm_changes=0.3)
+    assert select([streamy, techy], 7.0, 6.5, style="tech")[0].name == "techy"
+    assert select([streamy, techy], 7.0, 6.5, style="any")[0].name == "streamy"
+
+
+def test_loudest_window_finds_the_loud_part():
+    sr = 1000
+    samples = np.concatenate([0.1 * np.ones(20 * sr), np.ones(10 * sr), 0.1 * np.ones(30 * sr)])
+    start, stop = loudest_window(samples, sr, 10, 60000)
+    assert (start, stop) == (20000, 30000)
+
+
+def test_loudest_window_short_song():
+    assert loudest_window(np.ones(5000), 1000, 60, 5000) == (0, 5000)
+
+
+def test_pick_difficulty_prefers_in_range_then_style():
+    previews = [(6.0, cand("a", 6.3, 0.4)), (6.5, cand("b", 6.6, 0.2)), (7.0, cand("c", 6.9, 0.5))]
+    d, _ = pick_difficulty(previews, 6.5, 7.0, "any")
+    assert d == 7.0
+    d, why = pick_difficulty([(6.0, cand("a", 5.5)), (6.5, cand("b", 6.0))], 6.5, 7.0, "any")
+    assert d == 6.5 and "closest" in why

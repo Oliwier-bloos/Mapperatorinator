@@ -115,6 +115,74 @@ class Candidate:
     chords_3plus: float
     jack_rate: float
     invalid: int
+    monotone: float = 0.0       # share of notes inside 8+ gaps of the same rhythm (streams of any snap)
+    rhythm_changes: float = 0.0  # share of consecutive gaps that differ
+
+
+# Style presets: default tags, tags to steer away from, and what "more of this style" means
+STYLES = {
+    "any": {"tags": [], "avoid": []},
+    "tech": {"tags": ["skillset/tech", "tech/complex snap"], "avoid": ["streams/stamina", "style/jumpstream"]},
+    "jacks": {"tags": ["style/chordjack", "skillset/speedjack"], "avoid": ["style/jumpstream", "style/handstream"]},
+}
+
+
+def style_score(c: Candidate, style: str) -> float:
+    if style == "tech":
+        return c.rhythm_changes - c.monotone
+    if style == "jacks":
+        return c.jack_rate
+    return c.repetition
+
+
+def rhythm_stats(osu_text: str, keys: int, run_length: int = 8) -> tuple[float, float]:
+    """(monotone, rhythm_changes): share of notes in runs of `run_length`+ equal gaps, and share
+    of consecutive gaps that differ. Gaps are compared at 1/24 beat resolution."""
+    reds = red_lines(osu_text)
+    times = sorted({n.time for n in parse_notes(osu_text, keys)})
+    if not reds or len(times) < 3:
+        return 0.0, 0.0
+    gaps = []
+    for a, b in zip(times, times[1:]):
+        governing = [r for r in reds if r[0] <= a + 1]
+        beat = (governing[-1] if governing else reds[0])[1]
+        gaps.append(round((b - a) / beat * 24))
+    changes = sum(x != y for x, y in zip(gaps, gaps[1:])) / (len(gaps) - 1)
+    in_runs, current = 0, 1
+    for x, y in zip(gaps, gaps[1:] + [None]):
+        if x == y:
+            current += 1
+        else:
+            if current >= run_length:
+                in_runs += current
+            current = 1
+    return in_runs / len(gaps), changes
+
+
+def loudest_window(samples: np.ndarray, sample_rate: int, seconds: float, end_ms: float) -> tuple[int, int]:
+    """Start and end (ms) of the loudest `seconds` long stretch before `end_ms`."""
+    block = int(0.5 * sample_rate)
+    count = min(len(samples) // block, int(end_ms / 500))
+    width = int(seconds * 2)
+    if count <= width:
+        return 0, int(min(end_ms, seconds * 1000))
+    energy = (samples[:count * block].reshape(count, block) ** 2).mean(axis=1)
+    sums = np.convolve(energy, np.ones(width), mode="valid")
+    start = int(np.argmax(sums)) * 500
+    return start, start + int(seconds * 1000)
+
+
+def pick_difficulty(previews: list[tuple[float, Candidate]], min_stars: float, max_stars: float,
+                    style: str) -> tuple[float, str]:
+    """The difficulty request whose preview lands in the star range with the most of the style;
+    if none lands in range, the one closest to it."""
+    in_range = [(d, c) for d, c in previews if min_stars - 0.05 <= c.stars <= max_stars + 0.05]
+    if in_range:
+        d, c = max(in_range, key=lambda dc: (round(style_score(dc[1], style), 2), dc[1].stars))
+        return d, f"{c.stars:.2f} stars in the preview"
+    middle = (min_stars + max_stars) / 2
+    d, c = min(previews, key=lambda dc: abs(dc[1].stars - middle))
+    return d, f"closest to the range ({c.stars:.2f} stars in the preview)"
 
 
 def finer_than_quarter(osu_text: str, keys: int) -> float:
@@ -224,18 +292,20 @@ def describe(name: str, path: Path, keys: int) -> Candidate:
     notes = parse_notes(text, keys)
     stats = pattern_stats(notes, keys)
     length_s = max(1e-3, (notes[-1].time - notes[0].time) / 1000) if notes else 1e-3
+    monotone, changes = rhythm_stats(text, keys)
     return Candidate(
         name=name, path=str(path), stars=star_rating(text), notes_per_s=len(notes) / length_s,
         finer_than_quarter=finer_than_quarter(text, keys), repetition=pattern_repetition(text, keys),
         spike=density_spike(text, keys), holds=stats["holds"], chords_3plus=stats["chords_3plus"],
-        jack_rate=stats["jack_rate"], invalid=stats["invalid"],
+        jack_rate=stats["jack_rate"], invalid=stats["invalid"], monotone=monotone, rhythm_changes=changes,
     )
 
 
 def select(candidates: list[Candidate], max_stars: float, min_stars: float | None = None,
-           max_spike: float = 1.35) -> tuple[Candidate, str]:
+           max_spike: float = 1.35, style: str = "any") -> tuple[Candidate, str]:
     """Pick a candidate: valid and under the cap, preferably at least `min_stars` (default one star
-    under the cap) and without a density spike, then the one whose patterns repeat most."""
+    under the cap) and without a density spike, then the one with the most of the style (for "any":
+    the patterns that repeat most), then the most pattern repetition."""
     if min_stars is None:
         min_stars = max_stars - 1.0
     pool = [c for c in candidates if c.invalid == 0] or candidates
@@ -249,8 +319,8 @@ def select(candidates: list[Candidate], max_stars: float, min_stars: float | Non
         return best, f"no candidate between {min_stars} and {max_stars} stars; picked the hardest under the cap"
     calm = [c for c in close if c.spike <= max_spike]
     group = calm or close
-    best = max(group, key=lambda c: (round(c.repetition, 2), c.stars))
-    reason = "best pattern structure under the cap"
+    best = max(group, key=lambda c: (round(style_score(c, style), 2), round(c.repetition, 2), c.stars))
+    reason = "best pattern structure under the cap" if style == "any" else f"most {style} in the star range"
     if not calm:
         reason += f" (every candidate has a density spike above {max_spike}x)"
     return best, reason
@@ -391,8 +461,14 @@ def main():
     parser.add_argument("--difficulties", type=float, nargs="+", default=None,
                         help="Difficulties requested from the model (default: 1 and 0.5 below --max-stars). "
                              "How many stars a request gives varies by song, so trying two helps.")
-    parser.add_argument("--tags", nargs="*", default=[], help="Style tags, e.g. style/chordjack skillset/speedjack")
-    parser.add_argument("--avoid-tags", nargs="*", default=[], help="Tags to steer away from")
+    parser.add_argument("--style", choices=sorted(STYLES), default="any",
+                        help="tech: complex snaps and changing rhythm, few long streams; jacks: chordjack and "
+                             "speedjack; any: let the music decide. Sets default tags and how the best try is picked.")
+    parser.add_argument("--tags", nargs="*", default=None, help="Style tags (default: from --style), e.g. style/chordjack")
+    parser.add_argument("--avoid-tags", nargs="*", default=None, help="Tags to steer away from (default: from --style)")
+    parser.add_argument("--preview-seconds", type=float, default=60,
+                        help="First try each difficulty request on the loudest this-many seconds and generate the "
+                             "full song only with the best one (0 = generate every request in full; slower)")
     parser.add_argument("--holds", type=float, default=0.05, help="Hold note ratio")
     parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1])
     parser.add_argument("--temperatures", type=float, nargs="+", default=[0.7],
@@ -428,8 +504,13 @@ def main():
                             "-c:a", "libmp3lame", "-b:a", "320k", str(audio)], check=True)
     sys.path.insert(0, str(REPO_ROOT))
     from osuT5.osuT5.dataset.data_utils import load_audio_file
-    end_ms = music_end_ms(load_audio_file(str(audio), 16000), 16000)
+    samples = load_audio_file(str(audio), 16000)
+    end_ms = music_end_ms(samples, 16000)
     print(f"{title}: music ends at {end_ms / 1000:.1f} s")
+    started = time.time()
+
+    def elapsed() -> str:
+        return f"[{(time.time() - started) / 60:.1f} min]"
 
     common = [f"audio_path={hydra_string(str(audio))}", "gamemode=3", f"keycount={args.keys}", "year=2024"]
 
@@ -451,7 +532,8 @@ def main():
     if args.double_bpm:
         timing_text = double_bpm(timing_text)
     timing_path.write_text(timing_text, encoding="utf-8")
-    print("  timing: " + ", ".join(f"{bpm:g} BPM from {t / 1000:.1f} s" for t, bpm in timing_signature(timing_text)))
+    print("  timing: " + ", ".join(f"{bpm:g} BPM from {t / 1000:.1f} s" for t, bpm in timing_signature(timing_text))
+          + f" {elapsed()}")
 
     # 3. Candidates
     map_overrides = common + [
@@ -461,40 +543,61 @@ def main():
         f"cfg_scale={args.cfg_scale}", "cfg_conditions=[difficulty]" if args.cfg_scale > 1 else "cfg_conditions=[]",
         f"mania_column_temperature={args.column_temperature}",
     ]
-    if args.tags:
-        map_overrides.append(f"descriptors={hydra_list(args.tags)}")
-        if args.avoid_tags:
+    tags = args.tags if args.tags is not None else STYLES[args.style]["tags"]
+    avoid_tags = args.avoid_tags if args.avoid_tags is not None else STYLES[args.style]["avoid"]
+    if tags:
+        map_overrides.append(f"descriptors={hydra_list(tags)}")
+        if avoid_tags:
             # The negative prompt needs as many descriptors as the positive one
-            avoid = (args.avoid_tags * len(args.tags))[:len(args.tags)]
+            avoid = (avoid_tags * len(tags))[:len(tags)]
             map_overrides.append(f"negative_descriptors={hydra_list(avoid)}")
-    jobs = []
-    for difficulty in difficulties:
-        for temperature in args.temperatures:
-            for seed in args.seeds:
-                name = f"d{difficulty:g}_t{temperature:g}_s{seed}"
-                jobs.append((name, map_overrides + [f"difficulty={difficulty}", f"seed={seed}", f"temperature={temperature}",
-                                                    f"version={hydra_string(name)}"] + extra, work / f"cand_{name}"))
-    print(f"Generating {len(jobs)} candidates ...")
+    min_stars = args.min_stars if args.min_stars is not None else args.max_stars - 1.0
+
+    def job(name: str, difficulty: float, seed: int, temperature: float, **more) -> tuple[str, list[str], Path]:
+        overrides = with_overrides(map_overrides + extra, difficulty=difficulty, seed=seed, temperature=temperature,
+                                   version=hydra_string(name), **more)
+        return name, overrides, work / name
+
+    # Preview: try each difficulty request on the loudest stretch, then generate the full song only with the best
+    if args.preview_seconds > 0 and len(difficulties) > 1:
+        start, stop = loudest_window(samples, 16000, args.preview_seconds, end_ms)
+        print(f"Previewing {len(difficulties)} difficulty requests on {mmss(start)}-{mmss(stop)} ...")
+        preview_jobs = [job(f"preview_d{d:g}", d, args.seeds[0], args.temperatures[0], start_time=start, end_time=stop)
+                        for d in difficulties]
+        results = run_parallel(preview_jobs, args.parallel)  # in finishing order, so match by name
+        previews = [(d, describe(name, results[name], args.keys))
+                    for d, (name, _, _) in zip(difficulties, preview_jobs) if results.get(name)]
+        if previews:
+            for d, c in previews:
+                print(f"  difficulty {d:g}: {c.stars:.2f} stars, {c.notes_per_s:.1f} notes/s, "
+                      f"{c.monotone:.0%} in long same-rhythm runs, {c.rhythm_changes:.0%} rhythm changes")
+            chosen, why = pick_difficulty(previews, min_stars, args.max_stars, args.style)
+            difficulties = [chosen]
+            print(f"  using difficulty {chosen:g}: {why} {elapsed()}")
+
+    jobs = [job(f"cand_d{d:g}_t{t:g}_s{s}", d, s, t) for d in difficulties for t in args.temperatures for s in args.seeds]
+    print(f"Generating {len(jobs)} full-length candidates ...")
     maps = run_parallel(jobs, args.parallel)
 
     # 4. Score and pick
     candidates = [describe(name, path, args.keys) for name, path in maps.items() if path]
     if not candidates:
         sys.exit("Every candidate failed")
-    best, reason = select(candidates, args.max_stars, args.min_stars)
+    best, reason = select(candidates, args.max_stars, args.min_stars, style=args.style)
     print()
-    print(f"{'candidate':18} {'stars':>6} {'notes/s':>8} {'<1/4':>6} {'repeat':>7} {'spike':>6} {'holds':>6} {'3+ch':>5} {'jacks':>6}")
+    print(f"{'candidate':22} {'stars':>6} {'notes/s':>8} {'<1/4':>6} {'repeat':>7} {'streamy':>8} {'changes':>8} "
+          f"{'spike':>6} {'holds':>6} {'3+ch':>5} {'jacks':>6}")
     for c in sorted(candidates, key=lambda c: c.stars):
         mark = "  <- picked" if c is best else ""
-        print(f"{c.name:18} {c.stars:6.2f} {c.notes_per_s:8.1f} {c.finer_than_quarter:6.0%} {c.repetition:7.0%} "
-              f"{c.spike:6.2f} {c.holds:6.0%} {c.chords_3plus:5.0%} {c.jack_rate:6.0%}{mark}")
-    print(f"Picked {best.name}: {reason}")
+        print(f"{c.name:22} {c.stars:6.2f} {c.notes_per_s:8.1f} {c.finer_than_quarter:6.0%} {c.repetition:7.0%} "
+              f"{c.monotone:8.0%} {c.rhythm_changes:8.0%} {c.spike:6.2f} {c.holds:6.0%} {c.chords_3plus:5.0%} "
+              f"{c.jack_rate:6.0%}{mark}")
+    print(f"Picked {best.name}: {reason} {elapsed()}")
 
     # 5. Fix sections much harder than the rest of the map
     final_path, fixes = Path(best.path), []
     if not args.no_fix_spikes:
         overrides = next(o for name, o, _ in jobs if name == best.name)
-        min_stars = args.min_stars if args.min_stars is not None else args.max_stars - 1.0
         final_path, fixes = fix_spikes(final_path, overrides, work, args.keys, args.fix_seeds, args.parallel,
                                        min_stars, args.max_stars, args.max_fixes)
         if not fixes:
@@ -511,7 +614,8 @@ def main():
     (work / "candidates.json").write_text(json.dumps({
         "picked": best.name, "reason": reason, "spike_fixes": fixes, "final": asdict(final),
         "candidates": [asdict(c) for c in candidates]}, indent=1, default=str))
-    print(f"Final map: {final.stars:.2f} stars, {final.notes_per_s:.1f} notes/s, {final.repetition:.0%} repetition")
+    print(f"Final map: {final.stars:.2f} stars, {final.notes_per_s:.1f} notes/s, {final.repetition:.0%} repetition, "
+          f"{final.monotone:.0%} in long same-rhythm runs, {final.rhythm_changes:.0%} rhythm changes {elapsed()}")
     print(f"Wrote {osz}")
 
 
