@@ -101,6 +101,14 @@ def test_select_takes_hardest_under_cap_when_none_near():
     assert best.name == "b" and "hardest" in reason
 
 
+def test_select_respects_min_stars():
+    candidates = [cand("a", 6.2, 0.9), cand("b", 6.6, 0.3), cand("c", 6.9, 0.2)]
+    best, _ = select(candidates, 7.0, min_stars=6.5)
+    assert best.name == "b"
+    best, _ = select(candidates, 7.0)
+    assert best.name == "a"
+
+
 def test_select_when_all_over_cap():
     best, reason = select([cand("a", 7.4), cand("b", 7.9)], 7.0)
     assert best.name == "a" and "over" in reason

@@ -151,19 +151,21 @@ def describe(name: str, path: Path, keys: int) -> Candidate:
     )
 
 
-def select(candidates: list[Candidate], max_stars: float, max_spike: float = 1.35,
-           near: float = 1.0) -> tuple[Candidate, str]:
-    """Pick a candidate: valid and under the cap, preferably within `near` stars of it and
-    without a density spike, then the one whose patterns repeat most (best structure)."""
+def select(candidates: list[Candidate], max_stars: float, min_stars: float | None = None,
+           max_spike: float = 1.35) -> tuple[Candidate, str]:
+    """Pick a candidate: valid and under the cap, preferably at least `min_stars` (default one star
+    under the cap) and without a density spike, then the one whose patterns repeat most."""
+    if min_stars is None:
+        min_stars = max_stars - 1.0
     pool = [c for c in candidates if c.invalid == 0] or candidates
     under = [c for c in pool if c.stars <= max_stars + 0.05]
     if not under:
         best = min(pool, key=lambda c: c.stars)
         return best, f"every candidate is over {max_stars} stars; picked the easiest"
-    close = [c for c in under if c.stars >= max_stars - near]
+    close = [c for c in under if c.stars >= min_stars - 0.05]
     if not close:
         best = max(under, key=lambda c: c.stars)
-        return best, f"no candidate within {near} stars of the cap; picked the hardest under it"
+        return best, f"no candidate between {min_stars} and {max_stars} stars; picked the hardest under the cap"
     calm = [c for c in close if c.spike <= max_spike]
     group = calm or close
     best = max(group, key=lambda c: (round(c.repetition, 2), c.stars))
@@ -245,6 +247,7 @@ def main():
     parser.add_argument("audio", type=Path)
     parser.add_argument("--keys", type=int, default=4)
     parser.add_argument("--max-stars", type=float, default=7.0, help="Star rating cap for the chosen map")
+    parser.add_argument("--min-stars", type=float, default=None, help="Preferred lowest star rating (default: 1 under the cap)")
     parser.add_argument("--difficulties", type=float, nargs="+", default=None,
                         help="Difficulties requested from the model (default: 1 and 0.5 below --max-stars). "
                              "How many stars a request gives varies by song, so trying two helps.")
@@ -334,7 +337,7 @@ def main():
     candidates = [describe(name, path, args.keys) for name, path in maps.items() if path]
     if not candidates:
         sys.exit("Every candidate failed")
-    best, reason = select(candidates, args.max_stars)
+    best, reason = select(candidates, args.max_stars, args.min_stars)
     print()
     print(f"{'candidate':18} {'stars':>6} {'notes/s':>8} {'<1/4':>6} {'repeat':>7} {'spike':>6} {'holds':>6} {'3+ch':>5} {'jacks':>6}")
     for c in sorted(candidates, key=lambda c: c.stars):
